@@ -47,6 +47,8 @@ STATIC_ASSETS_DIR = os.path.join(DIR, 'static-assets')
 if not os.path.exists(STATIC_ASSETS_DIR):
     os.mkdir(STATIC_ASSETS_DIR)
 
+LAW_DOCS_PATH = os.path.join(os.path.dirname(DIR), 'law-docs')
+
 
 PORTAL_CLIENT_CLASS = None
 PORTAL_HOST = None
@@ -72,9 +74,9 @@ filetypes = {
     'woff2',
 }
 
-HISTORICAL_VERSIONS_PATH_PREFIXES = ('/_publication', '/_date', '/_compare')
-PORTAL_PATH_PREFIXES = ('/_portal', '/_api') + \
-    HISTORICAL_VERSIONS_PATH_PREFIXES
+AUTH_PATH_PREFIXES = ('/_api/authenticate', '/_api/check-hashes', )
+HISTORICAL_VERSIONS_PATH_PREFIXES = ('/_publication', '/_date', '/_compare', )
+PORTAL_PATH_PREFIXES = ('/_portal', '/_api') + HISTORICAL_VERSIONS_PATH_PREFIXES
 
 
 # custom 404 error template
@@ -137,7 +139,7 @@ class RequestHandler(SimpleHTTPRequestHandler):
     if ERROR_404_TEMPLATE:
         error_message_format = ERROR_404_TEMPLATE
 
-    def _proxy(self, Client, host, upstream_name):
+    def _proxy(self, Client, host, upstream_name, method='GET', body=None):
         """
         proxy the current request to the given host using the given
         http.client Client class. 404 if not configured to proxy
@@ -155,11 +157,14 @@ class RequestHandler(SimpleHTTPRequestHandler):
         req_headers.update(self.headers)
         req_headers.pop('Host', None)
         req_headers.update({
-            'X-Forwarded-For': 'self.address_string()',
+            'X-Forwarded-For': self.address_string(),
             'X-Forwarded-Host': self.headers['Host'],
             'X-Forwarded-Proto': 'http',
         })
-        client.request('GET', self.path, headers=req_headers)
+        if method in http.client._METHODS_EXPECTING_BODY:
+            client.request(method, self.path, headers=req_headers, body=body)
+        else:
+            client.request(method, self.path, headers=req_headers)
         try:
             resp = client.getresponse()
         except:
@@ -193,10 +198,13 @@ class RequestHandler(SimpleHTTPRequestHandler):
             self.send_header('Location', location)
             self.end_headers()
         else:
-            # default to html if no valid filetype - this is not the right way to do this - it should be a retry.
-            if not self.path.endswith('/') and ('.' not in self.path or self.path.rsplit('.', 1)[1] not in filetypes):
-                self.path = self.path + '.html'
             super().do_GET()
+
+    def do_POST(self):
+        if self.path in AUTH_PATH_PREFIXES:
+            content_len = int(self.headers.get('Content-Length'))
+            body = self.rfile.read(content_len)
+            return self._proxy(PORTAL_CLIENT_CLASS, PORTAL_HOST, 'portal', method='POST', body=body)
 
     def translate_path(self, path):
         """Translate a /-separated PATH to the local filename syntax.
@@ -211,8 +219,6 @@ class RequestHandler(SimpleHTTPRequestHandler):
         # abandon query parameters
         path = path.split('?', 1)[0]
         path = path.split('#', 1)[0]
-        # Don't forget explicit trailing slash when normalizing. Issue17324
-        trailing_slash = path.rstrip().endswith('/')
         try:
             path = urllib.parse.unquote(path, errors='surrogatepass')
         except UnicodeDecodeError:
@@ -226,13 +232,28 @@ class RequestHandler(SimpleHTTPRequestHandler):
                 # Ignore components that are not a simple file/directory name
                 continue
             path = os.path.join(path, word)
-        if trailing_slash:
-            path += '/'
 
-        if os.path.isdir(path) or path.endswith(".html") or os.path.exists(path):  # html or files in root dir
-            return path
-        else:  # static assets
-            return os.path.join(STATIC_ASSETS_DIR, os.path.relpath(path, DIR))
+        if path is None:
+            return ''
+        path_ext = path.rsplit('.', 1)
+        html_path = path + '.html'
+
+        if path.endswith('.pdf'):
+            return os.path.join(self.server.law_docs_path, os.path.relpath(path, DIR))
+        elif len(path_ext) > 1 and path_ext[1] in filetypes:
+            if os.path.isfile(path):
+                return path
+            else:
+                return os.path.join(STATIC_ASSETS_DIR, os.path.relpath(path, DIR))
+        elif os.path.isfile(html_path):
+            return html_path
+        elif os.path.isdir(path):
+            index_page = os.path.join(path, 'index.html')
+            return index_page
+
+    def end_headers(self):
+        self.send_header('Access-Control-Allow-Origin', '*')
+        SimpleHTTPRequestHandler.end_headers(self)
 
 
 def get_http_client_info(upstream_name, url):
@@ -244,6 +265,7 @@ def get_http_client_info(upstream_name, url):
     scheme, host, *_ = urllib.parse.urlparse(url)
     if not scheme:
         print('Must include scheme in {}-proxy-url (e.g. https://example.com, rather than example.com)'.format(upstream_name))
+    host = host.replace('localhost', '127.0.0.1')  # fix slow network issues on Win
     Client = getattr(http.client, scheme.upper() + 'Connection')
     print('PROXYING: "/_{}" to {}'.format(upstream_name, url))
     return Client, host
@@ -264,6 +286,8 @@ if __name__ == '__main__':
                         help='url to proxy portal requests to. [default: None]')
     parser.add_argument('--no-open-browser', default=False, action="store_true",
                         help='do not open the library in default browser after starting server.')
+    parser.add_argument('--law-docs-path', default=LAW_DOCS_PATH,
+                        help='a path to the law-docs directory.')
     parser.add_argument('--static-assets-repo-url', default=STATIC_ASSETS_REPO_URL,
                         help='a git repository url from which to download static assets.')
     parser.add_argument('--force-update-static-assets', default=False, action="store_true",
@@ -281,6 +305,8 @@ if __name__ == '__main__':
         pass
     redirects = {r[0]: r[1] for r in raw_redirects}
     httpd.redirects = redirects
+
+    httpd.law_docs_path = args.law_docs_path
 
     sa = httpd.socket.getsockname()
     url = 'http://{}:{}'.format(sa[0], sa[1])
